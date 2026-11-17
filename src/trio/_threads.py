@@ -260,6 +260,7 @@ async def to_thread_run_sync(
     thread_name: str | None = None,
     abandon_on_cancel: bool = False,
     limiter: CapacityLimiter | None = None,
+    inherit_thread_state: bool = False,
 ) -> RetT:
     """Convert a blocking operation into an async operation using a thread.
 
@@ -282,6 +283,12 @@ async def to_thread_run_sync(
           arguments, use :func:`functools.partial`.
       abandon_on_cancel (bool): Whether to abandon this thread upon
           cancellation of this operation. See discussion below.
+      inherit_thread_state (bool): Create a fresh worker thread rather than
+          reusing a cached worker, so operating-system thread-local state
+          (such as Linux namespace and CPU affinity) is inherited from the
+          calling thread. Default is False to avoid the overhead of a new
+          thread on every call. The synchronous callable still runs off the
+          event loop.
       thread_name (str): Optional string to set the name of the thread.
           Will always set `threading.Thread.name`, but only set the os name
           if pthread.h is available (i.e. most POSIX installations).
@@ -423,7 +430,12 @@ async def to_thread_run_sync(
     await limiter.acquire_on_behalf_of(placeholder)
     with _track_active_thread():
         try:
-            start_thread_soon(worker_fn, deliver_worker_fn_result, thread_name)
+            if inherit_thread_state:
+                start_thread_soon(
+                    worker_fn, deliver_worker_fn_result, thread_name, reuse_worker=False
+                )
+            else:
+                start_thread_soon(worker_fn, deliver_worker_fn_result, thread_name)
         except:
             limiter.release_on_behalf_of(placeholder)
             raise
@@ -442,9 +454,9 @@ async def to_thread_run_sync(
 
         while True:
             # wait_task_rescheduled return value cannot be typed
-            msg_from_thread: outcome.Outcome[RetT] | Run[object] | RunSync[object] = (
-                await trio.lowlevel.wait_task_rescheduled(abort)
-            )
+            msg_from_thread: (
+                outcome.Outcome[RetT] | Run[object] | RunSync[object]
+            ) = await trio.lowlevel.wait_task_rescheduled(abort)
             if isinstance(msg_from_thread, outcome.Outcome):
                 return msg_from_thread.unwrap()
             elif isinstance(msg_from_thread, Run):

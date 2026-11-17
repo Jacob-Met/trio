@@ -14,6 +14,10 @@ async def test() -> None:
     # is just regression tests + sanity checks.
     await trio.run_process("python", executable="ls")
     await trio.lowlevel.open_process("python", executable="ls")
+    await trio.run_process("python", inherit_thread_state=True, executable="ls")
+    await trio.lowlevel.open_process(
+        "python", inherit_thread_state=True, executable="ls"
+    )
 
     # note: there's no error code on the type ignore as it varies
     # between platforms.

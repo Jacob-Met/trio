@@ -308,6 +308,7 @@ async def _open_process(
     stdin: int | HasFileno | None = None,
     stdout: int | HasFileno | None = None,
     stderr: int | HasFileno | None = None,
+    inherit_thread_state: bool = False,
     **options: object,
 ) -> Process:
     r"""Execute a child program in a new process.
@@ -350,6 +351,12 @@ async def _open_process(
           which causes the child's standard output and standard error
           messages to be intermixed on a single standard output stream,
           attached to whatever the ``stdout`` option says to attach it to.
+      inherit_thread_state (bool): When True, spawn via a fresh worker
+          thread that inherits operating-system thread-local state (for
+          example, Linux namespaces and CPU affinity) from the calling
+          thread. The default reuses worker threads for faster startup;
+          those workers may have been created with different thread state.
+          In either mode, subprocess creation runs outside the event loop.
       **options: Other :ref:`general subprocess options <subprocess-options>`
           are also accepted.
 
@@ -422,6 +429,7 @@ async def _open_process(
                 stderr=stderr,
                 **options,
             ),
+            inherit_thread_state=inherit_thread_state,
         )
         # We did not fail, so dismiss the stack for the trio ends
         cleanup_on_fail.pop_all()
@@ -469,6 +477,7 @@ async def _run_process(
     capture_stdout: bool = False,
     capture_stderr: bool = False,
     check: bool = True,
+    inherit_thread_state: bool = False,
     deliver_cancel: Callable[[Process], Awaitable[object]] | None = None,
     task_status: TaskStatus[Process] = trio.TASK_STATUS_IGNORED,
     **options: object,
@@ -632,6 +641,11 @@ async def _run_process(
           In any case, `run_process` will always wait for the child process to
           exit before raising `Cancelled`.
 
+      inherit_thread_state (bool): When True, create a fresh worker to launch
+          the process with the calling thread's OS-level state (for example,
+          Linux CPU affinity and namespaces). The default instead uses a
+          cached worker, which may have different thread state. Both choices
+          keep process creation off the event loop.
       **options: :func:`run_process` also accepts any :ref:`general subprocess
           options <subprocess-options>` and passes them on to the
           :class:`~trio.Process` constructor. This includes the
@@ -735,7 +749,11 @@ async def _run_process(
 
     # Opening the process does not need to be inside the nursery, so we put it outside
     # so any exceptions get directly seen by users.
-    proc = await _open_process(command, **options)  # type: ignore[arg-type]
+    proc = await _open_process(
+        command,
+        inherit_thread_state=inherit_thread_state,
+        **options,  # type: ignore[arg-type]
+    )
     async with trio.open_nursery() as nursery:
         try:
             if input_ is not None:
@@ -805,6 +823,7 @@ class GeneralProcessArgs(TypedDict, total=False):
     stdout: int | HasFileno | None
     stderr: int | HasFileno | None
     close_fds: bool
+    inherit_thread_state: bool
     cwd: StrOrBytesPath | None
     env: Mapping[str, str] | None
     executable: StrOrBytesPath | None
