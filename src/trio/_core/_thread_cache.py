@@ -131,9 +131,17 @@ name_counter = count()
 
 
 class WorkerThread(Generic[RetT]):
-    __slots__ = ("_default_name", "_job", "_thread", "_thread_cache", "_worker_lock")
+    __slots__ = (
+        "_default_name",
+        "_job",
+        "_reuse_worker",
+        "_thread",
+        "_thread_cache",
+        "_worker_lock",
+    )
 
-    def __init__(self, thread_cache: ThreadCache) -> None:
+    def __init__(self, thread_cache: ThreadCache, *, reuse_worker: bool = True) -> None:
+        self._reuse_worker = reuse_worker
         self._job: (
             tuple[
                 Callable[[], RetT],
@@ -199,7 +207,8 @@ class WorkerThread(Generic[RetT]):
         # job. We do this *before* calling 'deliver', so that if
         # 'deliver' triggers a new job, it can be assigned to us
         # instead of spawning a new thread.
-        self._thread_cache._idle_workers[self] = None
+        if self._reuse_worker:
+            self._thread_cache._idle_workers[self] = None
         try:
             deliver(result)
         except BaseException as e:
@@ -211,6 +220,8 @@ class WorkerThread(Generic[RetT]):
             if self._worker_lock.acquire(timeout=IDLE_TIMEOUT):
                 # We got a job
                 self._handle_job()
+                if not self._reuse_worker:
+                    return
             else:
                 # Timeout acquiring lock, so we can probably exit. But,
                 # there's a race condition: we might be assigned a job *just*
@@ -240,12 +251,19 @@ class ThreadCache:
         fn: Callable[[], RetT],
         deliver: Callable[[outcome.Outcome[RetT]], object],
         name: str | None = None,
+        *,
+        reuse_worker: bool = True,
     ) -> None:
         worker: WorkerThread[RetT]
-        try:
-            worker, _ = self._idle_workers.popitem()
-        except KeyError:
-            worker = WorkerThread(self)
+        if reuse_worker:
+            try:
+                worker, _ = self._idle_workers.popitem()
+            except KeyError:
+                worker = WorkerThread(self)
+        else:
+            # This thread is born from the caller's current OS thread, so it
+            # inherits per-thread kernel state instead of an old worker's.
+            worker = WorkerThread(self, reuse_worker=False)
         worker._job = (fn, deliver, name)
         worker._worker_lock.release()
 
@@ -257,6 +275,8 @@ def start_thread_soon(
     fn: Callable[[], RetT],
     deliver: Callable[[outcome.Outcome[RetT]], object],
     name: str | None = None,
+    *,
+    reuse_worker: bool = True,
 ) -> None:
     """Runs ``deliver(outcome.capture(fn))`` in a worker thread.
 
@@ -282,6 +302,9 @@ def start_thread_soon(
 
         deliver (sync function): Takes the `outcome.Outcome` of ``fn``, and
           delivers it. *Must not block.*
+        reuse_worker (bool): Defaults to True. If False, start a one-shot
+          thread from the caller so its OS-level thread state is inherited,
+          and exit that worker when the job is complete.
 
     Because worker threads are cached and reused for multiple calls, neither
     function should mutate thread-level state, like `threading.local` objects
@@ -317,7 +340,10 @@ def start_thread_soon(
         limit how many threads they're using then it's polite to respect that.
 
     """
-    THREAD_CACHE.start_thread_soon(fn, deliver, name)
+    if reuse_worker:
+        THREAD_CACHE.start_thread_soon(fn, deliver, name)
+    else:
+        THREAD_CACHE.start_thread_soon(fn, deliver, name, reuse_worker=False)
 
 
 def clear_worker_threads() -> (

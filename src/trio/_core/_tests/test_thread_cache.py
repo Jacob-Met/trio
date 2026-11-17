@@ -16,7 +16,6 @@ from .._thread_cache import ThreadCache, start_thread_soon
 from .tutil import gc_collect_harder, slow
 
 if TYPE_CHECKING:
-
     from collections.abc import Generator
 
     from outcome import Outcome
@@ -240,3 +239,17 @@ def test_clear_thread_cache_after_fork() -> None:
         # git blame for how to do that. however, that times out for some
         # reason when having `tests/` in `source` for coverage.py.
         os._exit(0)
+
+
+def test_uncached_thread_preserves_one_shot_lifetime() -> None:
+    cache = ThreadCache()
+    q: Queue[threading.Thread] = Queue()
+    cache.start_thread_soon(
+        threading.current_thread,
+        lambda result: q.put(result.unwrap()),
+        reuse_worker=False,
+    )
+    worker = q.get(timeout=1)
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+    assert not cache._idle_workers

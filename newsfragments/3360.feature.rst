@@ -1,0 +1,1 @@
+Allow subprocess launches and synchronous worker jobs to inherit the calling OS thread's namespaces and affinity without blocking Trio's event loop.

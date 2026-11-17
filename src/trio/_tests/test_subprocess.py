@@ -786,3 +786,58 @@ async def test_subprocess_pidfd_unnotified() -> None:
             # for everything to notice
             await noticed_exit.wait()
         assert noticed_exit.is_set(), "child task wasn't woken after poll, DEADLOCK"
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "sched_setaffinity"), reason="requires Linux CPU affinity"
+)
+async def test_process_inherits_calling_os_thread_state() -> None:
+    original_affinity = os.sched_getaffinity(0)
+    if len(original_affinity) < 2:
+        pytest.skip("requires at least two allowed CPUs")
+    cached_affinity = await trio.to_thread.run_sync(lambda: os.sched_getaffinity(0))
+    assert cached_affinity == original_affinity
+    restricted_affinity = {min(original_affinity)}
+    child = python("import os; print(sorted(os.sched_getaffinity(0)))")
+    expected = repr(sorted(restricted_affinity)).encode() + b"\n"
+    os.sched_setaffinity(0, restricted_affinity)
+    try:
+        default = await run_process(child, capture_stdout=True)
+        assert default.stdout != expected
+        inherited = await run_process(
+            child, capture_stdout=True, inherit_thread_state=True
+        )
+        assert inherited.stdout == expected
+    finally:
+        os.sched_setaffinity(0, original_affinity)
+
+
+async def test_inherited_thread_state_spawn_does_not_block_trio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import time
+    from threading import get_native_id
+
+    caller_id = get_native_id()
+    worker_ids: list[int] = []
+    original_popen = subprocess.Popen
+    ticked = trio.Event()
+
+    def delayed_spawn(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        worker_ids.append(get_native_id())
+        time.sleep(0.08)
+        return original_popen(*args, **kwargs)  # type: ignore[call-overload,no-any-return]
+
+    monkeypatch.setattr(subprocess, "Popen", delayed_spawn)
+
+    async def tick() -> None:
+        await trio.sleep(0.02)
+        ticked.set()
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(tick)
+        proc = await open_process(EXIT_TRUE, inherit_thread_state=True)
+        assert ticked.is_set(), "subprocess startup blocked the Trio event loop"
+        await proc.wait()
+    assert worker_ids
+    assert worker_ids[0] != caller_id
