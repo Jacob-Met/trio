@@ -224,7 +224,7 @@ class NeedHandshakeError(Exception):
 
 
 class _Once:
-    __slots__ = ("_afn", "_args", "_done", "started")
+    __slots__ = ("_afn", "_args", "_done", "_failed", "started")
 
     def __init__(
         self,
@@ -235,20 +235,30 @@ class _Once:
         self._args = args
         self.started = False
         self._done = _sync.Event()
+        self._failed = False
 
     async def ensure(self, *, checkpoint: bool) -> None:
         if not self.started:
             self.started = True
-            await self._afn(*self._args)
-            self._done.set()
-        elif not checkpoint and self._done.is_set():
-            return
-        else:
+            try:
+                await self._afn(*self._args)
+            except BaseException:
+                # A failed (or cancelled) handshake must wake its waiters too.
+                # They cannot safely retry the now-broken TLS stream.
+                self._failed = True
+                self._done.set()
+                raise
+            else:
+                self._done.set()
+        elif checkpoint or not self._done.is_set():
             await self._done.wait()
+
+        if self._failed:
+            raise trio.BrokenResourceError
 
     @property
     def done(self) -> bool:
-        return bool(self._done.is_set())
+        return bool(self._done.is_set() and not self._failed)
 
 
 _State = _Enum("_State", ["OK", "BROKEN", "CLOSED"])

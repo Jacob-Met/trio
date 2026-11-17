@@ -1,0 +1,1 @@
+Wake concurrent SSLStream handshake waiters when the handshake fails or is cancelled, instead of leaving them blocked indefinitely.
