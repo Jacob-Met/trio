@@ -1,0 +1,1 @@
+Reject cross-task cancel scope exits and report scopes left entered when a task finishes, recovering cancellation-tree and deadline bookkeeping for abandoned scopes.

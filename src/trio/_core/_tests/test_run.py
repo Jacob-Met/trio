@@ -847,9 +847,109 @@ async def test_cancel_scope_misnesting_3() -> None:
         value = await nursery.start(task3)
         assert isinstance(value, _core.CancelScope)
         scope: _core.CancelScope = value
-        with pytest.raises(RuntimeError, match="from unrelated"):
+        with pytest.raises(RuntimeError, match="different task"):
             scope.__exit__(None, None, None)
         scope.cancel()
+
+
+async def test_cancel_scope_leaked_by_exiting_task() -> None:
+    """A task must not leave its entered scope open after returning."""
+    scope = _core.CancelScope()
+
+    async def abandon_scope() -> None:
+        scope.__enter__()
+
+    with pytest.RaisesGroup(
+        pytest.RaisesExc(RuntimeError, match="Cancel scope stack corrupted")
+    ):
+        async with _core.open_nursery() as nursery:
+            nursery.start_soon(abandon_scope)
+    assert scope._cancel_status is None
+    assert scope._owner_task is None
+
+
+async def test_cancel_scope_cannot_exit_from_other_task() -> None:
+    """An unrelated task cannot exit the owner's active cancel scope."""
+    scope = _core.CancelScope()
+
+    async def owner(task_status: _core.TaskStatus[None]) -> None:
+        with scope:
+            task_status.started()
+            await sleep_forever()
+
+    async with _core.open_nursery() as nursery:
+        await nursery.start(owner)
+        with pytest.raises(RuntimeError, match="different task"):
+            scope.__exit__(None, None, None)
+        assert scope._cancel_status is not None
+        nursery.cancel_scope.cancel()
+
+
+async def test_nested_leaked_scopes_cleanup_deadlines() -> None:
+    """An abandoned task releases every scope and registered deadline."""
+    outer = _core.CancelScope(deadline=_core.current_time() + 1000)
+    inner = _core.CancelScope(deadline=_core.current_time() + 2000)
+
+    async def abandon_both() -> None:
+        outer.__enter__()
+        inner.__enter__()
+
+    with pytest.RaisesGroup(
+        pytest.RaisesExc(RuntimeError, match="without closing its cancel scopes")
+    ):
+        async with _core.open_nursery() as nursery:
+            nursery.start_soon(abandon_both)
+
+    assert outer._cancel_status is None
+    assert inner._cancel_status is None
+    assert outer._registered_deadline == inf
+    assert inner._registered_deadline == inf
+    assert outer._owner_task is None
+    assert inner._owner_task is None
+    # A caught exit-time error must not damage the next nursery.
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(_core.checkpoint)
+
+
+async def test_other_task_cannot_close_inherited_cancel_scope() -> None:
+    """An inherited cancellation status never transfers scope ownership."""
+    outer = _core.CancelScope()
+
+    async def child() -> None:
+        assert _core.current_task() is not outer._owner_task
+        with pytest.raises(RuntimeError, match="different task"):
+            outer.__exit__(None, None, None)
+        assert outer._cancel_status is not None
+        assert not outer.cancel_called
+        await _core.checkpoint()
+
+    with outer:
+        async with _core.open_nursery() as nursery:
+            nursery.start_soon(child)
+    assert outer._cancel_status is None
+
+
+async def test_leaked_scope_preserves_original_task_exception() -> None:
+    scope = _core.CancelScope()
+    original = ValueError("original error")
+
+    async def bad_task() -> None:
+        scope.__enter__()
+        raise original
+
+    def contains_original_context(error: RuntimeError) -> bool:
+        return error.__context__ is original
+
+    with pytest.RaisesGroup(
+        pytest.RaisesExc(
+            RuntimeError,
+            match="without closing its cancel scopes",
+            check=contains_original_context,
+        )
+    ):
+        async with _core.open_nursery() as nursery:
+            nursery.start_soon(bad_task)
+    assert scope._cancel_status is None
 
 
 # helper to check we're not outputting overly verbose tracebacks

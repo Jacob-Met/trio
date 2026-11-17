@@ -571,7 +571,9 @@ class CancelScope:
 
     Cancel scopes are not reusable or reentrant; that is, each cancel
     scope can be used for at most one ``with`` block.  (You'll get a
-    :exc:`RuntimeError` if you violate this rule.)
+    :exc:`RuntimeError` if you violate this rule.) A scope must also be
+    exited by the same task that entered it. Ending a task while one of
+    its scopes remains entered is an error.
 
     The :class:`CancelScope` constructor takes initial values for the
     cancel scope's :attr:`deadline` and :attr:`shield` attributes; these
@@ -581,6 +583,9 @@ class CancelScope:
 
     _cancel_status: CancelStatus | None = attrs.field(default=None, init=False)
     _has_been_entered: bool = attrs.field(default=False, init=False)
+    # The task that entered an active scope. Child tasks may inherit its
+    # cancellation status, but they may never close the scope themselves.
+    _owner_task: Task | None = attrs.field(default=None, init=False, repr=False)
     _registered_deadline: float = attrs.field(default=inf, init=False)
     _cancel_called: bool = attrs.field(default=False, init=False)
     cancelled_caught: bool = attrs.field(default=False, init=False)
@@ -616,6 +621,7 @@ class CancelScope:
                 "Each CancelScope may only be used for a single 'with' block",
             )
         self._has_been_entered = True
+        self._owner_task = task
 
         if self._relative_deadline != inf:
             assert self._deadline == inf
@@ -638,6 +644,21 @@ class CancelScope:
             new_exc.__context__ = exc
             return new_exc
         scope_task = current_task()
+        if (
+            self._owner_task is not scope_task
+            and not self._cancel_status.abandoned_by_misnesting
+        ):
+            # If the subtree has already been abandoned, allow best-effort
+            # unwinding in the other task so the original misnesting error
+            # isn't obscured by a second one during cleanup.
+            # Otherwise, inherited cancellation status grants no ownership:
+            # Reject the exit *before* changing any task or scope state.
+            new_exc = RuntimeError(
+                f"Cancel scope stack corrupted: attempted to exit {self!r} "
+                f"from a different task than the one that entered it\n{MISNESTING_ADVICE}",
+            )
+            new_exc.__context__ = exc
+            return new_exc
         if scope_task._cancel_status is not self._cancel_status:
             # Cancel scope misnesting: this cancel scope isn't the most
             # recently opened by this task (that's still open). That is,
@@ -696,6 +717,7 @@ class CancelScope:
         self._cancel_status.close()
         with self._might_change_registered_deadline():
             self._cancel_status = None
+        self._owner_task = None
         return exc
 
     @enable_ki_protection
@@ -2025,6 +2047,48 @@ class Runner:  # type: ignore[explicit-any]
             for lot in GLOBAL_PARKING_LOT_BREAKER[task]:
                 lot.break_lot(task)
             del GLOBAL_PARKING_LOT_BREAKER[task]
+
+        # Every task must return to the cancellation status inherited from
+        # its parent nursery before it can finish. Otherwise a scope entered
+        # by this task could outlive the task and be exited by another one,
+        # silently corrupting the cancellation tree (gh-3329).
+        inherited_status = (
+            task._parent_nursery._cancel_status
+            if task._parent_nursery is not None
+            else None
+        )
+        if (
+            task._cancel_status is not inherited_status
+            and not task._child_nurseries
+            and not (
+                task._cancel_status is not None
+                and task._cancel_status.abandoned_by_misnesting
+                and task._cancel_status.parent is None
+            )
+        ):
+            # Recover the tree in reverse nesting order where we can. The
+            # task is still current here, so its own scopes can be closed
+            # without modifying another task's cancellation status.
+            while (
+                task._cancel_status is not inherited_status
+                and task._cancel_status is not None
+                and task._cancel_status._scope._owner_task is task
+            ):
+                active = task._cancel_status
+                active._scope._close(None)
+                if task._cancel_status is active:
+                    # A pre-existing broken stack may prevent even recovery;
+                    # never spin forever on an uncloseable status.
+                    break
+            try:
+                raise RuntimeError(
+                    f"Cancel scope stack corrupted: {task!r} exited "
+                    f"without closing its cancel scopes\n{MISNESTING_ADVICE}",
+                )
+            except RuntimeError as new_exc:
+                if isinstance(outcome, Error):
+                    new_exc.__context__ = outcome.error
+                outcome = Error(new_exc)
 
         if (
             task._cancel_status is not None
